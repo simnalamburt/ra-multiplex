@@ -151,6 +151,15 @@ pub enum Request {
         /// `cwd.starts_with(workspace_root)` is true
         cwd: String,
     },
+    /// Stop an instance
+    ///
+    /// Sends a shutdown request the language server instance for
+    /// current working directory. Disconnects all clients.
+    Shutdown {
+        /// Selects instance with the longest path where
+        /// `cwd.starts_with(workspace_root)` is true
+        cwd: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

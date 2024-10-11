@@ -82,6 +82,7 @@ pub async fn process(
         }
         ext::Request::Status {} => status(instance_map, writer).await,
         ext::Request::Reload { cwd } => reload(cwd, instance_map, writer).await,
+        ext::Request::Shutdown { cwd } => shutdown(cwd, instance_map, writer).await,
     }
 }
 
@@ -153,6 +154,38 @@ async fn reload(
             .ok()
             .context("instance closed")?;
 
+        writer
+            .write_message(&Message::ResponseSuccess(ResponseSuccess::null(
+                RequestId::Number(0),
+            )))
+            .await
+            .context("writing response")?;
+    } else {
+        writer
+            .write_message(&Message::ResponseError(ResponseError {
+                jsonrpc: Version,
+                error: jsonrpc::Error {
+                    code: 0,
+                    message: "no instance found".into(),
+                    data: None,
+                },
+                id: RequestId::Number(0),
+            }))
+            .await
+            .context("writing response")?;
+        debug!(?cwd, "no instance found for path");
+    }
+
+    Ok(())
+}
+
+async fn shutdown(
+    cwd: String,
+    instance_map: Arc<Mutex<InstanceMap>>,
+    mut writer: LspWriter<OwnedWriteHalf>,
+) -> Result<()> {
+    if let Some(instance) = instance_map.lock().await.get_by_cwd(&cwd) {
+        instance.shutdown();
         writer
             .write_message(&Message::ResponseSuccess(ResponseSuccess::null(
                 RequestId::Number(0),

@@ -51,6 +51,11 @@ enum Cmd {
     /// For rust-analyzer send the `rust-analyzer/reloadWorkspace` extension request.
     /// Do nothing for other language servers.
     Reload {},
+
+    /// Shutdown language server
+    ///
+    /// Shutdown the language server for current workspace.
+    Shutdown {},
 }
 
 #[tokio::main]
@@ -77,6 +82,7 @@ async fn main() -> Result<()> {
         Some(Cmd::Status { json }) => ext::status(&config, json).await,
         Some(Cmd::Config {}) => ext::config(&config).await,
         Some(Cmd::Reload {}) => ext::reload(&config).await,
+        Some(Cmd::Shutdown {}) => ext::shutdown(&config).await,
         None => {
             let server_path = env::var("RA_MUX_SERVER").unwrap_or_else(|_| "rust-analyzer".into());
             proxy::run(&config, server_path, vec![]).await
