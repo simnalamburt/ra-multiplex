@@ -614,10 +614,14 @@ async fn wait_task(
     mut child: Child,
 ) {
     let key = instance.key.clone();
+    let mut shutdown_requested = false;
     loop {
         select! {
             biased;
-            _ = instance.shutdown.wait() => {
+            _ = instance.shutdown.wait(), if !shutdown_requested => {
+                // Avoid infinite loop.
+                shutdown_requested = true;
+
                 // We want to shut down the instance now.
                 //
                 // If we still have some clients connected we unfortunately cannot
