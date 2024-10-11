@@ -8,10 +8,11 @@ use serde_json::Value;
 use tokio::io::BufReader;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::{mpsc, Mutex};
-use tokio::task;
+use tokio::{select, task};
 use tracing::{debug, error, info, warn, Instrument};
 use uriparse::URI;
 
+use crate::flag::Flag;
 use crate::instance::{self, Instance, InstanceKey, InstanceMap};
 use crate::lsp::ext::{self, LspMuxOptions, Tag};
 use crate::lsp::jsonrpc::{
@@ -87,17 +88,29 @@ pub async fn process(
 #[derive(Clone)]
 pub struct Client {
     id: usize,
+    disconnect: Flag,
     sender: mpsc::Sender<Message>,
 }
 
 impl Client {
     fn new(id: usize) -> (Client, mpsc::Receiver<Message>) {
+        // Chosen for no particular reason, it's a nice round number.
         let (sender, receiver) = mpsc::channel(16);
-        (Client { id, sender }, receiver)
+        let client = Client {
+            id,
+            disconnect: Flag::new(),
+            sender,
+        };
+        (client, receiver)
     }
 
     pub fn id(&self) -> usize {
         self.id
+    }
+
+    /// Disconnect a client
+    pub fn disconnect(&self) {
+        self.disconnect.raise();
     }
 
     /// Send a message to the client channel
@@ -340,15 +353,21 @@ async fn output_task(
     instance: Arc<Instance>,
 ) {
     loop {
-        let message = match reader.read_message().await {
-            Ok(Some(message)) => message,
-            Ok(None) => {
-                debug!("client output closed");
+        let message = select! {
+            biased;
+            _ = client.disconnect.wait() => {
                 break;
             }
-            Err(err) => {
-                error!(?err, "error reading client output");
-                continue;
+            message = reader.read_message() => match message {
+                Ok(Some(message)) => message,
+                Ok(None) => {
+                    debug!("client output closed");
+                    break;
+                }
+                Err(err) => {
+                    error!(?err, "error reading client output");
+                    continue;
+                }
             }
         };
         instance.keep_alive();
@@ -356,14 +375,22 @@ async fn output_task(
         match message {
             Message::Request(req) if req.method == "shutdown" => {
                 // Client requested the server to shut down but other clients might still be connected.
-                // Instead we disconnect this client to prevent the editor hanging
-                // see <https://github.com/pr2502/ra-multiplex/issues/5>.
+                // We need to complete the shutdown flow with this client outselves to prevent
+                // the editor hanging, see <https://github.com/pr2502/ra-multiplex/issues/5>.
                 info!("client sent shutdown request, sending a response and closing connection");
 
                 // <https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#shutdown>
                 let res = ResponseSuccess::null(req.id);
                 // Ignoring error because we would've closed the connection regardless
                 let _ = client.send_message(res.into()).await;
+
+                // TODO the client is supposed to send an ExitNotification now
+                // <https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#exit>
+                // We should read and drop anything the client now sends until
+                // said notification and only then close the socket. However
+                // it seems helix is ok with us quitting immediately after the
+                // ResponseSuccess.
+
                 break;
             }
 

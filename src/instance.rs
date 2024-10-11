@@ -14,12 +14,13 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc::error::SendError;
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, Mutex};
 use tokio::{select, task};
 use tracing::{debug, error, field, info, instrument, trace, warn, Instrument};
 
 use crate::client::Client;
 use crate::config::Config;
+use crate::flag::Flag;
 use crate::lsp::ext::Tag;
 use crate::lsp::jsonrpc::{Message, Notification, Request, RequestId, ResponseSuccess, Version};
 use crate::lsp::transport::{LspReader, LspWriter};
@@ -55,8 +56,8 @@ pub struct Instance {
     /// Dynamic capabilities registered by the server
     dynamic_capabilities: Mutex<HashMap<String, lsp::Registration>>,
 
-    /// Wakes up `wait_task` and asks it to send SIGKILL to the instance.
-    close: Notify,
+    /// Wakes up `wait_task` and asks it to shut down the instance.
+    shutdown: Flag,
 
     /// Last time a message was sent to this instance
     ///
@@ -109,6 +110,11 @@ impl Instance {
         self.last_used.store(utc_now(), Ordering::Relaxed);
     }
 
+    /// Shuts down the instance
+    pub fn shutdown(&self) {
+        self.shutdown.raise();
+    }
+
     /// How many seconds is the instance idle for
     pub fn idle(&self) -> i64 {
         i64::max(0, utc_now() - self.last_used.load(Ordering::Relaxed))
@@ -149,6 +155,19 @@ impl Instance {
         };
         if clients.insert(client.id(), client).is_some() {
             unreachable!("BUG: added two clients with the same ID");
+        }
+    }
+
+    /// Disconnect all clients from this instance which is no longer available
+    ///
+    /// This function skips all instance cleanup, only takes care of clients.
+    /// Unfortunately we cannot gracefully tell clients the sever has died.
+    /// We just disconnect them and hope they handle it well, treat it as an
+    /// error state and recover without hanging their UI.
+    async fn disconnect_all_clients(&self) {
+        debug!("disconnecting all clients now");
+        for (_, client) in self.clients.lock().await.drain() {
+            client.disconnect();
         }
     }
 
@@ -376,7 +395,7 @@ async fn gc_task(
                 // Close timed out instance
                 if idle > i64::from(instance_timeout) && clients.is_empty() {
                     info!(pid = instance.pid, path = ?key.workspace_root, idle, "instance timed out");
-                    instance.close.notify_one();
+                    instance.shutdown();
                 }
             }
         }
@@ -480,7 +499,7 @@ async fn spawn(
         server: message_writer,
         clients: Mutex::default(),
         dynamic_capabilities: Mutex::default(),
-        close: Notify::new(),
+        shutdown: Flag::new(),
         last_used: AtomicI64::new(utc_now()),
     });
 
@@ -597,21 +616,41 @@ async fn wait_task(
     let key = instance.key.clone();
     loop {
         select! {
-            _ = instance.close.notified() => {
+            biased;
+            _ = instance.shutdown.wait() => {
+                // We want to shut down the instance now.
+                //
+                // If we still have some clients connected we unfortunately cannot
+                // gracefully tell them the sever has died.
+                // So we just disconnect them and hope they handle it well, treat it
+                // as an error state and recover without hanging their UI.
+
+                // Remove ourselves from the instance map to prevent new clients
+                // from connecting.
+                let _ = instance_map.lock().await.0.remove(&key);
+
+                // After we send a shutdown request it's not valid to send any
+                // more requests to the server, so we'll tell the clients off
+                // immediately instead of waiting for the exit branch here.
+                //
+                // Because this instance has been removed from the instance map
+                // already it's ok for them to reconnect immediately.
+                instance.disconnect_all_clients().await;
+
+                // FIXME use shutdown request instead of killing the server outright
                 if let Err(err) = child.start_kill() {
                     error!(?err, "failed to close child");
                 }
             }
             exit = child.wait() => {
-                // Remove the closing instance from the map so new clients spawn their own instance
-                instance_map.lock().await.0.remove(&key);
+                // The server is dead, someone killed it or it panicked.
 
-                // Disconnect all current clients
-                //
-                // We'll rely on the editor client to restart the ra-multiplex client,
-                // start a new connection and we'll spawn another instance like we'd with
-                // any other new client.
-                instance.clients.lock().await.clear();
+                // Remove the exitted instance from the instance map to prevent
+                // new clients from connecting.
+                let _ = instance_map.lock().await.0.remove(&key);
+
+                // We cannot handle client requests anymore.
+                instance.disconnect_all_clients().await;
 
                 match exit {
                     Ok(status) => {

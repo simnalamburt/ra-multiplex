@@ -1,4 +1,5 @@
 mod client;
+mod flag;
 mod instance;
 mod lsp;
 mod socketwrapper;
