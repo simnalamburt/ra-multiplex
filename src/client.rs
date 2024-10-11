@@ -389,7 +389,8 @@ async fn output_task(
         let message = select! {
             biased;
             _ = client.disconnect.wait() => {
-                break;
+                // Do not attempt to clean up.
+                return;
             }
             message = reader.read_message() => match message {
                 Ok(Some(message)) => message,
